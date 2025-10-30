@@ -20,10 +20,10 @@ CONTACT_EMAIL = os.getenv("CONTACT_EMAIL", "")
 ALLOWED = os.getenv("ALLOWED_ORIGINS", "http://localhost:8501,http://127.0.0.1:8501").split(",")
 
 # ---- performance knobs ----
-CANDIDATE_LIMIT = 8
+CANDIDATE_LIMIT = 5
 PAPERS_PER_DRUG = 8
 THREADS = 8
-OVERALL_DEADLINE = 45.0  # sec
+OVERALL_DEADLINE = 35.0  # sec
 
 # Cache HTTP for 6h; return stale on upstream error
 requests_cache.install_cache("ps11_cache", expire_after=6*60*60, stale_if_error=True)
@@ -76,7 +76,7 @@ def mock_candidates(disease: str) -> List[Candidate]:
     for i, c in enumerate(res, start=1): c.rank = i
     return res
 
-def build_candidate(disease: str, drug: str, phase_num: float) -> Candidate:
+def build_candidate(disease: str, drug: str, phase_num: float, trials_for_drug: list) -> Candidate:
     # (a) EuropePMC
     pos_hits, papers = search_papers(disease, drug, email=CONTACT_EMAIL)
     papers = papers[:PAPERS_PER_DRUG]
@@ -114,6 +114,18 @@ def build_candidate(disease: str, drug: str, phase_num: float) -> Candidate:
             url=f"https://www.ebi.ac.uk/chembl/compound_report_card/{chem.get('chembl_id')}/" if chem.get("chembl_id") else None,
             source="chembl"
         ))
+
+    # add 1–2 trial snippets for THIS drug
+    for t in (trials_for_drug or [])[:2]:
+        evidence.append(EvidenceItem(
+            type="trial",
+            id=f"NCT:{t.get('nct_id')}",
+            title="Primary outcome",
+            snippet=t.get("snippet"),
+            url=t.get("url"),
+            source="clinicaltrials"
+        ))
+
     return Candidate(
         rank=0, drug=pref, synonyms=chem.get("synonyms", []), ids={"chembl": chem.get("chembl_id") or ""},
         mechanism=moa or None, score=score,
@@ -133,10 +145,11 @@ def search(q: QueryBody, safe: int = Query(0, description="Safe-mode: 1 returns 
 
     try:
         # 1) Per-drug phases from trials (fast)
-        drug_phase, _trials_by_drug, _seen_trials = search_trials_by_disease(disease)
+        drug_phase, trials_by_drug, _seen_trials = search_trials_by_disease(disease)
         if not drug_phase:
-            for d in SAFE_FALLBACK_DRUGS:
-                drug_phase[d] = 0.0
+    # No interventions found for this condition — return empty so the UI shows the warning
+            return SearchResponse(query=disease, disease_canonical=disease, filters_applied=filt, results=[])
+
 
         # 2) Top N by phase
         items: List[Tuple[str, float]] = sorted(
@@ -148,9 +161,9 @@ def search(q: QueryBody, safe: int = Query(0, description="Safe-mode: 1 returns 
         remaining = OVERALL_DEADLINE - (time.monotonic() - start)
         if remaining <= 0:
             return SearchResponse(query=disease, disease_canonical=disease, filters_applied=filt, results=[])
-
+        items = sorted(drug_phase.items(), key=lambda kv: (-kv[1], kv[0].lower()))[:CANDIDATE_LIMIT]
         with cf.ThreadPoolExecutor(max_workers=THREADS) as pool:
-            futs = {pool.submit(build_candidate, disease, drug, ph): (drug, ph) for drug, ph in items}
+            futs = {pool.submit(build_candidate, disease, drug, ph, trials_by_drug.get(drug, [])): (drug, ph) for drug, ph in items}
             done, not_done = cf.wait(futs.keys(), timeout=remaining)
             for fut in done:
                 try:
@@ -178,3 +191,60 @@ def search(q: QueryBody, safe: int = Query(0, description="Safe-mode: 1 returns 
         # Never crash the socket; return structured error with empty results
         print("SEARCH FATAL:", e, traceback.format_exc())
         return SearchResponse(query=disease, disease_canonical=disease, filters_applied=filt, results=[])
+    
+from typing import List
+# (imports above already exist)
+
+@app.post("/search_fast", response_model=SearchResponse)
+def search_fast(q: QueryBody):
+    """
+    Ultra-stable endpoint: uses only ClinicalTrials.gov to propose drugs by intervention & phase.
+    No external literature/chem/safety calls => no crashes/timeouts.
+    """
+    disease = q.disease.strip()
+    filt = q.filters
+
+    # pull interventions & phases
+    drug_phase, trials_by_drug, _ = search_trials_by_disease(disease)
+    results: List[Candidate] = []
+
+    # build minimal candidates (phase + few trials only)
+    for drug, ph in sorted(drug_phase.items(), key=lambda kv: (-kv[1], kv[0].lower()))[:10]:
+        # filters
+        if filt.min_phase and ph < float(filt.min_phase):
+            continue
+
+        ev = []
+        for t in (trials_by_drug.get(drug) or [])[:2]:
+            ev.append(EvidenceItem(
+                type="trial",
+                id=f"NCT:{t.get('nct_id')}",
+                title="Primary outcome",
+                snippet=t.get("snippet"),
+                url=t.get("url"),
+                source="clinicaltrials"
+            ))
+
+        c = Candidate(
+            rank=0,
+            drug=drug,
+            synonyms=[],
+            ids={"chembl": ""},
+            mechanism=None,
+            score=ph + 0.1 * len(ev),  # simple score: phase + a tiny bump for evidence items
+            kpis={"best_trial_phase": ph, "papers": 0, "pos_outcome_snippets": 0},
+            safety=SafetyInfo(boxed_warning=False, highlights=[]),
+            evidence=ev
+        )
+        results.append(c)
+
+    results.sort(key=lambda c: c.score, reverse=True)
+    for i, c in enumerate(results, start=1):
+        c.rank = i
+
+    return SearchResponse(
+        query=disease,
+        disease_canonical=disease,
+        filters_applied=filt,
+        results=results
+    )

@@ -35,7 +35,7 @@ if st.button("Search"):
             }
         }
         try:
-            r = requests.post(f"{BACKEND}/search", json=payload, timeout=120)
+            r = requests.post(f"{BACKEND}/search_fast", json=payload, timeout=180)
             r.raise_for_status()
             data = r.json()
         except Exception as e:
@@ -57,6 +57,9 @@ if st.button("Search"):
         if rows:
             df = pd.DataFrame(rows)
             st.dataframe(df, use_container_width=True)
+        if not rows:
+            st.warning("No intervention drugs found for this condition from ClinicalTrials.gov. Try a broader condition name (e.g., 'Pulmonary fibrosis' instead of 'Idiopathic Pulmonary Fibrosis').")
+
 
         # Evidence cards
         for item in data.get("results", []):
