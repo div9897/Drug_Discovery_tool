@@ -1,7 +1,6 @@
 import requests
 from collections import defaultdict
 from typing import Dict, List, Tuple
-from ranking import phase_to_num
 
 # Robust parser for ClinicalTrials.gov v2
 # Returns:
